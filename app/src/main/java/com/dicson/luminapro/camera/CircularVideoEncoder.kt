@@ -4,136 +4,173 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentLinkedDeque
 
+/**
+ * CircularVideoEncoder — Búfer circular de video en RAM
+ * Graba continuamente los últimos ~3 segundos de video H.264
+ * para empaquetarlos dentro de la Motion Photo al tomar la foto.
+ */
 class CircularVideoEncoder(
-    private val width: Int, private val height: Int,
-    bitRate: Int, frameRate: Int
+    private val width: Int,
+    private val height: Int,
+    private val bitrate: Int,
+    private val fps: Int
 ) {
-    companion object {
-        private const val TAG = "CircularVideo"
-        private const val MIME_TYPE = "video/avc"
-        private const val MAX_BUFFER_DURATION_US = 3_000_000L
-    }
+    companion object { private const val TAG = "CircularEncoder" }
 
-    private var encoder: MediaCodec
+    private data class EncodedFrame(
+        val data: ByteArray,
+        val bufferInfo: MediaCodec.BufferInfo,
+        val timestamp: Long
+    )
+
+    private val encoder: MediaCodec
     val inputSurface: Surface
-    private val frameBuffer = mutableListOf<FrameData>()
-    @Volatile private var isRecording = false
-    @Volatile private var isStopped = false
+    private val circularBuffer = ConcurrentLinkedDeque<EncodedFrame>()
+    private val maxBufferDurationUs = 3_000_000L // 3 segundos
+    private var encoderThread: HandlerThread? = null
+    private var encoderHandler: Handler? = null
+    @Volatile private var isRunning = false
+    @Volatile private var hasKeyFrame = false
     private var actualOutputFormat: MediaFormat? = null
 
-    data class FrameData(val buffer: ByteBuffer, val info: MediaCodec.BufferInfo)
-
     init {
-        val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
+        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // Keyframe cada segundo para cortes limpios
         }
-        encoder = MediaCodec.createEncoderByType(MIME_TYPE)
+        encoder = MediaCodec.createEncoderByType("video/avc")
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = encoder.createInputSurface()
         encoder.start()
+        Log.i(TAG, "Encoder iniciado: ${width}x${height} @ ${bitrate/1000}kbps")
     }
 
     fun startDraining() {
-        if (isRecording || isStopped) return
-        isRecording = true
-        Thread({
-            val bufferInfo = MediaCodec.BufferInfo()
-            try {
-                while (isRecording && !isStopped) {
-                    val id: Int
-                    try { id = encoder.dequeueOutputBuffer(bufferInfo, 10_000) }
-                    catch (e: IllegalStateException) { break }
+        if (isRunning) return
+        isRunning = true
+        encoderThread = HandlerThread("EncoderDrain").apply { start() }
+        encoderHandler = Handler(encoderThread!!.looper)
+        encoderHandler?.post { drainLoop() }
+    }
 
-                    when {
-                        id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            actualOutputFormat = encoder.outputFormat
-                        }
-                        id >= 0 -> {
-                            val data = encoder.getOutputBuffer(id)
-                            if (data != null && bufferInfo.size > 0) {
-                                val clone = ByteBuffer.allocateDirect(bufferInfo.size)
-                                data.position(bufferInfo.offset)
-                                data.limit(bufferInfo.offset + bufferInfo.size)
-                                clone.put(data)
-                                clone.flip()
-                                val ci = MediaCodec.BufferInfo().apply {
-                                    set(0, bufferInfo.size, bufferInfo.presentationTimeUs, bufferInfo.flags)
-                                }
-                                synchronized(frameBuffer) {
-                                    frameBuffer.add(FrameData(clone, ci))
-                                    purgeOldFrames()
-                                }
+    private fun drainLoop() {
+        val info = MediaCodec.BufferInfo()
+        while (isRunning) {
+            try {
+                val index = encoder.dequeueOutputBuffer(info, 10_000) // 10ms timeout
+                when {
+                    index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        actualOutputFormat = encoder.outputFormat
+                        Log.i(TAG, "Formato obtenido: ${actualOutputFormat}")
+                    }
+                    index >= 0 -> {
+                        val buffer = encoder.getOutputBuffer(index) ?: continue
+                        if (info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                            val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                            if (isKey) hasKeyFrame = true
+
+                            if (hasKeyFrame) {
+                                val data = ByteArray(info.size)
+                                buffer.position(info.offset)
+                                buffer.get(data, 0, info.size)
+
+                                val frameCopy = MediaCodec.BufferInfo()
+                                frameCopy.set(info.offset, info.size, info.presentationTimeUs, info.flags)
+
+                                circularBuffer.addLast(EncodedFrame(data, frameCopy, info.presentationTimeUs))
+                                trimBuffer()
                             }
-                            try { encoder.releaseOutputBuffer(id, false) }
-                            catch (e: IllegalStateException) { break }
                         }
+                        encoder.releaseOutputBuffer(index, false)
                     }
                 }
-            } catch (e: Exception) { Log.e(TAG, "Drain error", e) }
-        }, "CircularEncoder-Drain").start()
-    }
-
-    private fun purgeOldFrames() {
-        if (frameBuffer.size < 2) return
-        val newest = frameBuffer.last().info.presentationTimeUs
-        val it = frameBuffer.iterator()
-        while (it.hasNext()) {
-            val f = it.next()
-            if (newest - f.info.presentationTimeUs > MAX_BUFFER_DURATION_US) it.remove()
-            else break
-        }
-    }
-
-    fun extractLivePhotoVideo(outputFile: File, delayMs: Long = 1500, cb: (ByteArray?) -> Unit) {
-        Thread({
-            try {
-                Thread.sleep(delayMs)
-                cb(saveToMp4(outputFile))
             } catch (e: Exception) {
-                Log.e(TAG, "Extract error", e)
-                cb(null)
+                if (isRunning) Log.w(TAG, "Drain error: ${e.message}")
             }
-        }, "LivePhoto-Extract").start()
+        }
     }
 
-    private fun saveToMp4(outputFile: File): ByteArray? {
-        val fmt = actualOutputFormat ?: return null
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var started = false
-        try {
-            val track = muxer.addTrack(fmt)
-            muxer.start(); started = true
-            val frames: List<FrameData>
-            synchronized(frameBuffer) { frames = ArrayList(frameBuffer) }
-            if (frames.isEmpty()) return null
-            val t0 = frames.first().info.presentationTimeUs
-            for (f in frames) {
-                if ((f.info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) continue
-                f.buffer.rewind()
-                val ni = MediaCodec.BufferInfo().apply {
-                    set(0, f.info.size, f.info.presentationTimeUs - t0, f.info.flags)
-                }
-                muxer.writeSampleData(track, f.buffer, ni)
-            }
-            Log.i(TAG, "Packed ${frames.size} frames")
-        } finally {
-            if (started) try { muxer.stop() } catch (_: Exception) {}
-            try { muxer.release() } catch (_: Exception) {}
+    private fun trimBuffer() {
+        if (circularBuffer.isEmpty()) return
+        val newestTs = circularBuffer.peekLast()?.timestamp ?: return
+        while (circularBuffer.size > 2) {
+            val oldest = circularBuffer.peekFirst() ?: break
+            if (newestTs - oldest.timestamp > maxBufferDurationUs) {
+                circularBuffer.pollFirst()
+            } else break
         }
-        return if (outputFile.exists() && outputFile.length() > 0) outputFile.readBytes() else null
     }
+
+    /**
+     * Extrae el video del búfer circular como un archivo MP4 válido.
+     * Espera [postCaptureDelayMs] para capturar el "futuro" de la Live Photo,
+     * luego empaqueta todo en MP4 y devuelve los bytes via callback.
+     */
+    fun extractLivePhotoVideo(outputFile: File, postCaptureDelayMs: Long, callback: (ByteArray?) -> Unit) {
+        val handler = encoderHandler ?: run { callback(null); return }
+        // Esperar para capturar el futuro
+        handler.postDelayed({
+            try {
+                val format = actualOutputFormat
+                if (format == null || circularBuffer.isEmpty()) {
+                    Log.w(TAG, "Sin formato o búfer vacío (format=$format, frames=${circularBuffer.size})")
+                    callback(null)
+                    return@postDelayed
+                }
+
+                // Capturar snapshot de los frames
+                val frames = circularBuffer.toList()
+                if (frames.size < 3) {
+                    Log.w(TAG, "Solo ${frames.size} frames en búfer, insuficiente")
+                    callback(null)
+                    return@postDelayed
+                }
+
+                val baseTimestamp = frames.first().timestamp
+
+                // Crear el MP4 con MediaMuxer
+                val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                val trackIndex = muxer.addTrack(format)
+                muxer.start()
+
+                for (frame in frames) {
+                    val buf = ByteBuffer.wrap(frame.data)
+                    val info = MediaCodec.BufferInfo()
+                    info.set(0, frame.data.size, frame.timestamp - baseTimestamp, frame.bufferInfo.flags)
+                    muxer.writeSampleData(trackIndex, buf, info)
+                }
+
+                muxer.stop()
+                muxer.release()
+
+                val mp4Bytes = outputFile.readBytes()
+                Log.i(TAG, "MP4 generado: ${mp4Bytes.size} bytes, ${frames.size} frames")
+                callback(mp4Bytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error creando MP4", e)
+                callback(null)
+            }
+        }, postCaptureDelayMs)
+    }
+
+    /** Devuelve true si hay suficientes frames para crear una Live Photo */
+    fun isReady(): Boolean = hasKeyFrame && circularBuffer.size >= 3 && actualOutputFormat != null
 
     fun stop() {
-        isRecording = false; isStopped = true
+        isRunning = false
         try { encoder.stop() } catch (_: Exception) {}
         try { encoder.release() } catch (_: Exception) {}
+        try { encoderThread?.quitSafely() } catch (_: Exception) {}
+        circularBuffer.clear()
     }
 }

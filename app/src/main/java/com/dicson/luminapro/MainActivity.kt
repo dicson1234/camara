@@ -189,26 +189,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun takeLivePhoto() {
         luminaCamera.onPhotoCaptured = { jpegBytes ->
-            if (livePhotoEnabled) {
+            if (livePhotoEnabled && videoEncoder.isReady()) {
                 val tmpFile = File(cacheDir, "tmp_live.mp4")
                 videoEncoder.extractLivePhotoVideo(tmpFile, 1500L) { mp4Bytes ->
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
                             if (mp4Bytes != null && mp4Bytes.isNotEmpty()) {
                                 val liveBytes = LivePhotoBuilder.buildMotionPhotoBytes(jpegBytes, mp4Bytes)
-                                saveToGallery(liveBytes, "Lumina_Live_${System.currentTimeMillis()}.jpg")
+                                // Nombre DEBE contener "MP" antes de .jpg (especificación Google Motion Photo)
+                                val filename = "LuminaMP_${System.currentTimeMillis()}.jpg"
+                                saveToGallery(liveBytes, filename)
                                 showToast("¡Live Photo guardada! ✨")
                             } else {
                                 saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
-                                showToast("Foto guardada ✨")
+                                showToast("Foto guardada (sin video) ✨")
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "Error", e)
-                            showToast("Error al guardar")
+                            Log.e(TAG, "Error guardando Live Photo", e)
+                            // Fallback: guardar solo la foto
+                            saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                            showToast("Foto guardada (fallback)")
                         }
                     }
                 }
             } else {
+                // Modo normal o encoder no listo
+                if (livePhotoEnabled && !videoEncoder.isReady()) {
+                    Log.w(TAG, "Live Photo activado pero encoder no listo aún")
+                }
                 CoroutineScope(Dispatchers.IO).launch {
                     saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                     showToast("Foto guardada ✨")
