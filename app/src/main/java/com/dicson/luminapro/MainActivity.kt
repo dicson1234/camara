@@ -24,10 +24,9 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.dicson.luminapro.camera.CircularVideoEncoder
 import com.dicson.luminapro.camera.LivePhotoBuilder
 import com.dicson.luminapro.camera.LuminaCameraManager
-import java.io.File
+import com.dicson.luminapro.camera.PreviewVideoRecorder
 import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
@@ -37,10 +36,11 @@ class MainActivity : AppCompatActivity() {
         private const val REQ = 10
     }
 
-    private lateinit var camera: LuminaCameraManager
-    private lateinit var encoder: CircularVideoEncoder
+    private lateinit var cam: LuminaCameraManager
+    private lateinit var recorder: PreviewVideoRecorder
     private lateinit var viewFinder: TextureView
-    private lateinit var captureButton: View
+
+    private lateinit var captureBtn: View
     private lateinit var captureRing: View
     private lateinit var switchBtn: View
     private lateinit var liveLabel: TextView
@@ -56,18 +56,17 @@ class MainActivity : AppCompatActivity() {
     private var flash = 0
     private var timer = 0
     private var hdr = false
-    private var zoom = 1.0f
+    private var zoom = 1f
     private var ready = false
-
     private lateinit var scaleDetector: ScaleGestureDetector
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
-        captureButton = findViewById(R.id.captureButton)
+        captureBtn = findViewById(R.id.captureButton)
         captureRing = findViewById(R.id.captureRing)
         switchBtn = findViewById(R.id.switchCameraBtn)
         liveLabel = findViewById(R.id.liveIndicator)
@@ -81,8 +80,7 @@ class MainActivity : AppCompatActivity() {
         setupZoom()
         setupButtons()
 
-        if (allPermsOk()) initCamera()
-        else ActivityCompat.requestPermissions(this, perms(), REQ)
+        if (allOk()) initCamera() else ActivityCompat.requestPermissions(this, perms(), REQ)
     }
 
     private fun perms(): Array<String> {
@@ -92,14 +90,14 @@ class MainActivity : AppCompatActivity() {
         return p.toTypedArray()
     }
 
-    private fun allPermsOk() = perms().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
+    private fun allOk() = perms().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
 
     private fun setupZoom() {
         scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(d: ScaleGestureDetector): Boolean {
                 if (!ready) return true
                 zoom = (zoom * d.scaleFactor).coerceIn(1f, 10f)
-                camera.setZoom(zoom)
+                cam.zoom(zoom)
                 zoomLabel.text = String.format("%.1fx", zoom)
                 return true
             }
@@ -107,7 +105,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupButtons() {
-        captureButton.setOnClickListener {
+        captureBtn.setOnClickListener {
             if (!ready) return@setOnClickListener
             animateShutter()
             if (timer > 0) {
@@ -135,7 +133,7 @@ class MainActivity : AppCompatActivity() {
             if (!ready) return@setOnClickListener
             flash = (flash + 1) % 3
             flashBtn.text = when (flash) { 0 -> "⚡OFF"; 1 -> "⚡ON"; else -> "⚡A" }
-            camera.setFlash(flash)
+            cam.flash(flash)
         }
 
         timerLabel.setOnClickListener {
@@ -145,13 +143,13 @@ class MainActivity : AppCompatActivity() {
 
         hdrBtn.setOnClickListener {
             if (!ready) return@setOnClickListener
-            hdr = !hdr; hdrBtn.alpha = if (hdr) 1f else 0.4f; camera.setHdr(hdr)
+            hdr = !hdr; hdrBtn.alpha = if (hdr) 1f else 0.4f; cam.hdr(hdr)
         }
 
         viewFinder.setOnTouchListener { v, ev ->
             scaleDetector.onTouchEvent(ev)
             if (ev.action == MotionEvent.ACTION_UP && !scaleDetector.isInProgress && ready) {
-                camera.focusAt(ev.x, ev.y, v.width, v.height)
+                cam.focus(ev.x, ev.y, v.width, v.height)
                 showFocusRing(ev.x, ev.y)
             }
             true
@@ -161,14 +159,13 @@ class MainActivity : AppCompatActivity() {
     // === ANIMACIONES ===
 
     private fun animateShutter() {
-        val sx = ObjectAnimator.ofFloat(captureButton, "scaleX", 1f, 0.85f)
-        val sy = ObjectAnimator.ofFloat(captureButton, "scaleY", 1f, 0.85f)
-        val ux = ObjectAnimator.ofFloat(captureButton, "scaleX", 0.85f, 1f).apply { interpolator = OvershootInterpolator(3f) }
-        val uy = ObjectAnimator.ofFloat(captureButton, "scaleY", 0.85f, 1f).apply { interpolator = OvershootInterpolator(3f) }
+        val sx = ObjectAnimator.ofFloat(captureBtn, "scaleX", 1f, 0.85f)
+        val sy = ObjectAnimator.ofFloat(captureBtn, "scaleY", 1f, 0.85f)
+        val ux = ObjectAnimator.ofFloat(captureBtn, "scaleX", 0.85f, 1f).apply { interpolator = OvershootInterpolator(3f) }
+        val uy = ObjectAnimator.ofFloat(captureBtn, "scaleY", 0.85f, 1f).apply { interpolator = OvershootInterpolator(3f) }
         AnimatorSet().apply {
             play(sx).with(sy); play(ux).with(uy).after(sx)
-            sx.duration = 80; sy.duration = 80; ux.duration = 200; uy.duration = 200
-            start()
+            sx.duration = 80; sy.duration = 80; ux.duration = 200; uy.duration = 200; start()
         }
         shutterFlash.visibility = View.VISIBLE; shutterFlash.alpha = 0.6f
         shutterFlash.animate().alpha(0f).setDuration(200).withEndAction { shutterFlash.visibility = View.GONE }.start()
@@ -183,82 +180,74 @@ class MainActivity : AppCompatActivity() {
         val parent = viewFinder.parent as? FrameLayout ?: return
         parent.addView(ring)
         ring.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200)
-            .withEndAction { ring.animate().alpha(0f).setDuration(500).setStartDelay(500)
-                .withEndAction { parent.removeView(ring) }.start() }.start()
+            .withEndAction {
+                ring.animate().alpha(0f).setDuration(500).setStartDelay(500)
+                    .withEndAction { parent.removeView(ring) }.start()
+            }.start()
     }
 
     // === CÁMARA ===
 
     private fun initCamera() {
-        camera = LuminaCameraManager(this)
-        camera.startBackgroundThread()
-        encoder = CircularVideoEncoder(1280, 720, 4_000_000, 30)
-        encoder.startDraining()
+        cam = LuminaCameraManager(this)
+        cam.startBg()
+        recorder = PreviewVideoRecorder()
         ready = true
 
         viewFinder.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) { openCamera(st) }
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) { openCam(st) }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { camera.closeCamera(); return true }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { cam.close(); recorder.stop(); return true }
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
-        if (viewFinder.isAvailable) openCamera(viewFinder.surfaceTexture!!)
+        if (viewFinder.isAvailable) openCam(viewFinder.surfaceTexture!!)
     }
 
-    private fun openCamera(st: SurfaceTexture) {
+    private fun openCam(st: SurfaceTexture) {
         st.setDefaultBufferSize(1920, 1080)
-        camera.openCamera(Surface(st), encoder.inputSurface, useFront)
-        viewFinder.postDelayed({ configureTransform() }, 300)
+        cam.open(Surface(st), useFront)
+        // Iniciar captura de preview para Live Photo (desde el TextureView, NO desde la cámara)
+        viewFinder.postDelayed({
+            recorder.startCapturing(viewFinder)
+            configureTransform()
+        }, 500)
     }
 
     private fun configureTransform() {
-        val pw = camera.previewSize.height.toFloat() // rotado 90°
-        val ph = camera.previewSize.width.toFloat()
+        val pw = cam.previewSize.height.toFloat()
+        val ph = cam.previewSize.width.toFloat()
         val vw = viewFinder.width.toFloat()
         val vh = viewFinder.height.toFloat()
         if (vw == 0f || vh == 0f) return
-
-        val sx = vw / pw; val sy = vh / ph
-        val scale = Math.max(sx, sy)
-        val matrix = Matrix()
-        matrix.setScale(pw * scale / vw, ph * scale / vh)
-        matrix.postTranslate((vw - pw * scale) / 2f, (vh - ph * scale) / 2f)
-        viewFinder.setTransform(matrix)
+        val sx = vw / pw; val sy = vh / ph; val s = Math.max(sx, sy)
+        val m = Matrix()
+        m.setScale(pw * s / vw, ph * s / vh)
+        m.postTranslate((vw - pw * s) / 2f, (vh - ph * s) / 2f)
+        viewFinder.setTransform(m)
     }
 
     private fun restartCamera() {
-        camera.closeCamera()
-        camera.startBackgroundThread()
-        viewFinder.surfaceTexture?.let { openCamera(it) }
+        recorder.stop()
+        cam.close()
+        cam.startBg()
+        viewFinder.surfaceTexture?.let { openCam(it) }
     }
 
-    /**
-     * Obtiene la rotación actual del dispositivo en grados (0, 90, 180, 270)
-     */
-    private fun getDeviceRotation(): Int {
-        val rotation = if (Build.VERSION.SDK_INT >= 30) display?.rotation ?: 0
-                       else @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation
-        return when (rotation) {
-            android.view.Surface.ROTATION_0 -> 0
-            android.view.Surface.ROTATION_90 -> 90
-            android.view.Surface.ROTATION_180 -> 180
-            android.view.Surface.ROTATION_270 -> 270
-            else -> 0
-        }
+    private fun getRotation(): Int {
+        val r = if (Build.VERSION.SDK_INT >= 30) display?.rotation ?: 0
+                else @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation
+        return when (r) { Surface.ROTATION_90 -> 90; Surface.ROTATION_180 -> 180; Surface.ROTATION_270 -> 270; else -> 0 }
     }
 
     // === CAPTURA ===
 
     private fun capture() {
-        val deviceRotation = getDeviceRotation()
-        Log.i(TAG, "Capture: live=$liveOn, encoderReady=${encoder.isReady()}, encoderConnected=${camera.encoderConnected}")
+        Log.i(TAG, "Capture: live=$liveOn, recorderReady=${recorder.isReady()}")
 
-        camera.onPhotoCaptured = { jpegBytes ->
-            Log.i(TAG, "📸 Got ${jpegBytes.size} bytes")
+        cam.onPhoto = { jpegBytes ->
+            Log.i(TAG, "📸 Got ${jpegBytes.size}b")
 
-            val canLive = liveOn && camera.encoderConnected && encoder.isReady()
-
-            if (canLive) {
+            if (liveOn && recorder.isReady()) {
                 // === LIVE PHOTO ===
                 runOnUiThread {
                     liveRec.visibility = View.VISIBLE; liveRec.alpha = 1f
@@ -267,29 +256,27 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                val tmp = File(cacheDir, "tmp_mp4_${System.currentTimeMillis()}.mp4")
-                encoder.extractVideo(tmp, 1500L) { mp4Bytes ->
+                recorder.extractVideo(cacheDir, 1500L) { mp4Bytes ->
                     runOnUiThread {
                         liveRec.animate().alpha(0f).setDuration(200)
                             .withEndAction { liveRec.visibility = View.GONE }.start()
                     }
 
-                    // SIEMPRE guardar algo, pase lo que pase
                     CoroutineScope(Dispatchers.IO).launch {
                         if (mp4Bytes != null && mp4Bytes.size > 1000) {
                             try {
-                                Log.i(TAG, "🎬 Building Motion Photo: jpeg=${jpegBytes.size}, mp4=${mp4Bytes.size}")
+                                Log.i(TAG, "🎬 Building Motion Photo: jpg=${jpegBytes.size} mp4=${mp4Bytes.size}")
                                 val motion = LivePhotoBuilder.buildMotionPhotoBytes(jpegBytes, mp4Bytes)
-                                saveToGallery(motion, "LuminaMP_${System.currentTimeMillis()}.jpg")
-                                showToast("¡Live Photo! ✨")
+                                save(motion, "LuminaMP_${System.currentTimeMillis()}.jpg")
+                                showToast("¡Live Photo! ✨🎬")
                             } catch (e: Exception) {
-                                Log.e(TAG, "Motion Photo build failed", e)
-                                saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                                Log.e(TAG, "Motion Photo error", e)
+                                save(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                                 showToast("Foto guardada")
                             }
                         } else {
-                            Log.w(TAG, "No video data, saving static photo")
-                            saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                            Log.w(TAG, "No video, saving static")
+                            save(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                             showToast("Foto guardada ✨")
                         }
                     }
@@ -297,21 +284,21 @@ class MainActivity : AppCompatActivity() {
             } else {
                 // === FOTO NORMAL ===
                 CoroutineScope(Dispatchers.IO).launch {
-                    saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                    save(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                     showToast("Foto guardada ✨")
                 }
             }
         }
 
-        camera.takePicture(deviceRotation)
+        cam.takePicture(getRotation())
     }
 
     // === GALERÍA ===
 
-    private fun saveToGallery(bytes: ByteArray, name: String) {
-        Log.i(TAG, "💾 Saving: $name (${bytes.size} bytes)")
+    private fun save(bytes: ByteArray, name: String) {
+        Log.i(TAG, "💾 $name (${bytes.size}b)")
         try {
-            val values = ContentValues().apply {
+            val v = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, name)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                 put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
@@ -321,40 +308,25 @@ class MainActivity : AppCompatActivity() {
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
             }
-
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri == null) { Log.e(TAG, "❌ insert null"); return }
-
-            contentResolver.openOutputStream(uri)?.use { it.write(bytes); it.flush() }
-                ?: run { Log.e(TAG, "❌ stream null"); return }
-
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: run { Log.e(TAG, "❌ insert null"); return }
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes); it.flush() } ?: run { Log.e(TAG, "❌ stream null"); return }
             if (Build.VERSION.SDK_INT >= 29) {
-                contentResolver.update(uri, ContentValues().apply {
-                    put(MediaStore.Images.Media.IS_PENDING, 0)
-                }, null, null)
+                contentResolver.update(uri, ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
             }
-            Log.i(TAG, "✅ Saved: $uri")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Save error", e)
-        }
+            Log.i(TAG, "✅ Saved $uri")
+        } catch (e: Exception) { Log.e(TAG, "Save error", e) }
     }
 
-    private suspend fun showToast(msg: String) {
-        withContext(Dispatchers.Main) { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
-    }
+    private suspend fun showToast(m: String) { withContext(Dispatchers.Main) { Toast.makeText(this@MainActivity, m, Toast.LENGTH_SHORT).show() } }
+    private fun toast(m: String) { Toast.makeText(this, m, Toast.LENGTH_SHORT).show() }
 
-    private fun toast(msg: String) { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-
-    // === PERMISOS ===
-
-    override fun onRequestPermissionsResult(code: Int, p: Array<String>, r: IntArray) {
-        super.onRequestPermissionsResult(code, p, r)
-        if (code == REQ && allPermsOk()) initCamera()
-        else if (code == REQ) toast("Activa los permisos en Ajustes")
+    override fun onRequestPermissionsResult(c: Int, p: Array<String>, r: IntArray) {
+        super.onRequestPermissionsResult(c, p, r)
+        if (c == REQ && allOk()) initCamera() else if (c == REQ) toast("Activa permisos")
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        if (ready) { camera.closeCamera(); encoder.stop() }
+        if (ready) { recorder.stop(); cam.close() }
     }
 }
