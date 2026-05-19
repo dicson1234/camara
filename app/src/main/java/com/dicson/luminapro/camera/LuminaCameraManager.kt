@@ -6,7 +6,6 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.hardware.camera2.*
 import android.hardware.camera2.params.MeteringRectangle
-import android.media.Image
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -21,13 +20,11 @@ class LuminaCameraManager(private val context: Context) {
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
-    private var backgroundThread: HandlerThread? = null
-    private var backgroundHandler: Handler? = null
+    private var bgThread: HandlerThread? = null
+    private var bgHandler: Handler? = null
     private var imageReader: ImageReader? = null
     private var currentCameraId: String? = null
-    private var previewRequestBuilder: CaptureRequest.Builder? = null
-    private var activePreviewSurface: Surface? = null
-    private var encoderSurface: Surface? = null
+    private var previewBuilder: CaptureRequest.Builder? = null
     var encoderConnected = false; private set
 
     var isFrontCamera = false; private set
@@ -35,247 +32,224 @@ class LuminaCameraManager(private val context: Context) {
     var onPhotoCaptured: ((ByteArray) -> Unit)? = null
 
     private var maxZoom = 1.0f
-    private var sensorArraySize: Rect? = null
-    var detectedPreviewSize: Size = Size(1920, 1080); private set
+    private var sensorRect: Rect? = null
+    var previewSize: Size = Size(1920, 1080); private set
 
     fun startBackgroundThread() {
-        backgroundThread?.quitSafely()
-        backgroundThread = HandlerThread("CameraBackground").apply { start() }
-        backgroundHandler = Handler(backgroundThread!!.looper)
+        bgThread?.quitSafely()
+        bgThread = HandlerThread("CamBG").apply { start() }
+        bgHandler = Handler(bgThread!!.looper)
     }
 
     @SuppressLint("MissingPermission")
-    fun openCamera(previewSurface: Surface, videoSurface: Surface?, w: Int, h: Int, front: Boolean = false) {
+    fun openCamera(previewSurface: Surface, videoSurface: Surface?, front: Boolean) {
         isFrontCamera = front
-        activePreviewSurface = previewSurface
-        encoderSurface = videoSurface
         val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
 
         val camId = cameraManager.cameraIdList.firstOrNull { id ->
             cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == facing
-        } ?: run { Log.e(TAG, "No camera found for facing=$facing"); return }
+        } ?: run { Log.e(TAG, "No camera $facing"); return }
         currentCameraId = camId
 
         val chars = cameraManager.getCameraCharacteristics(camId)
         maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1.0f
-        sensorArraySize = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        sensorRect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
-        val hwLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
-        Log.i(TAG, "HW Level: $hwLevel (0=LIMITED, 1=FULL, 2=LEGACY, 3=L3)")
 
         // Preview size
-        val previewSizes = map.getOutputSizes(android.graphics.SurfaceTexture::class.java)
-        detectedPreviewSize = chooseBestPreviewSize(previewSizes, w, h)
+        val sizes = map.getOutputSizes(android.graphics.SurfaceTexture::class.java)
+        previewSize = pickPreviewSize(sizes)
 
-        // Captura: usar resolución más segura en dispositivos LIMITED
-        val captureSizes = map.getOutputSizes(ImageFormat.JPEG)
-        val maxCapture = if (hwLevel == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL) {
-            captureSizes?.maxByOrNull { it.width * it.height } ?: Size(w, h)
-        } else {
-            // En LIMITED, usar máximo 12MP para evitar problemas con múltiples surfaces
-            captureSizes?.filter { it.width * it.height <= 12_000_000 }
-                ?.maxByOrNull { it.width * it.height }
-                ?: captureSizes?.maxByOrNull { it.width * it.height }
-                ?: Size(w, h)
-        }
-        Log.i(TAG, "Preview: ${detectedPreviewSize}, Capture: ${maxCapture}, Zoom: ${maxZoom}x")
+        // Capture size: máximo 12MP para compatibilidad amplia
+        val jpegSizes = map.getOutputSizes(ImageFormat.JPEG)
+        val captureSize = jpegSizes
+            ?.filter { it.width * it.height <= 12_500_000 }
+            ?.maxByOrNull { it.width * it.height }
+            ?: jpegSizes?.maxByOrNull { it.width * it.height }
+            ?: Size(4000, 3000)
+        Log.i(TAG, "Camera $camId: preview=$previewSize, capture=$captureSize, front=$front")
 
         imageReader?.close()
-        imageReader = ImageReader.newInstance(maxCapture.width, maxCapture.height, ImageFormat.JPEG, 2)
-        imageReader?.setOnImageAvailableListener({ reader ->
-            var image: Image? = null
+        imageReader = ImageReader.newInstance(captureSize.width, captureSize.height, ImageFormat.JPEG, 2)
+        imageReader!!.setOnImageAvailableListener({ reader ->
             try {
-                image = reader.acquireLatestImage()
-                if (image == null) { Log.w(TAG, "acquireLatestImage null"); isCapturing = false; return@setOnImageAvailableListener }
-                val buffer = image.planes[0].buffer
-                val bytes = ByteArray(buffer.remaining())
-                buffer.get(bytes)
-                Log.i(TAG, "✅ Foto capturada: ${bytes.size} bytes (${maxCapture.width}x${maxCapture.height})")
-                if (bytes.size > 1000) {
-                    onPhotoCaptured?.invoke(bytes)
-                } else {
-                    Log.w(TAG, "Foto demasiado pequeña, descartada")
-                }
+                val image = reader.acquireLatestImage() ?: run { isCapturing = false; return@setOnImageAvailableListener }
+                val buf = image.planes[0].buffer
+                val bytes = ByteArray(buf.remaining())
+                buf.get(bytes)
+                image.close()
+                isCapturing = false
+                Log.i(TAG, "✅ JPEG: ${bytes.size} bytes")
+                if (bytes.size > 1000) onPhotoCaptured?.invoke(bytes)
             } catch (e: Exception) {
-                Log.e(TAG, "Error procesando imagen", e)
-            } finally {
-                image?.close()
+                Log.e(TAG, "ImageReader error", e)
                 isCapturing = false
             }
-        }, backgroundHandler)
+        }, bgHandler)
 
         cameraManager.openCamera(camId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                Log.i(TAG, "✅ Cámara abierta: $camId")
-                cameraDevice = camera
-                createSession(previewSurface, videoSurface)
+            override fun onOpened(cam: CameraDevice) {
+                cameraDevice = cam
+                createSession(cam, previewSurface, videoSurface)
             }
-            override fun onDisconnected(camera: CameraDevice) {
-                Log.w(TAG, "Cámara desconectada")
-                cameraDevice = null; camera.close()
+            override fun onDisconnected(cam: CameraDevice) { cam.close(); cameraDevice = null }
+            override fun onError(cam: CameraDevice, err: Int) {
+                Log.e(TAG, "Camera error $err"); cam.close(); cameraDevice = null
             }
-            override fun onError(camera: CameraDevice, error: Int) {
-                Log.e(TAG, "❌ Error abriendo cámara: $error")
-                cameraDevice = null; camera.close()
-            }
-        }, backgroundHandler)
+        }, bgHandler)
     }
 
-    private fun chooseBestPreviewSize(sizes: Array<Size>?, targetW: Int, targetH: Int): Size {
-        if (sizes == null || sizes.isEmpty()) return Size(targetW, targetH)
-        sizes.firstOrNull { it.width == 1920 && it.height == 1080 }?.let { return it }
-        val targetRatio = targetW.toFloat() / targetH.toFloat()
-        return sizes
-            .filter { it.width >= 1280 && it.height >= 720 }
-            .minByOrNull { Math.abs(it.width.toFloat() / it.height.toFloat() - targetRatio) }
+    private fun pickPreviewSize(sizes: Array<Size>?): Size {
+        if (sizes == null) return Size(1920, 1080)
+        return sizes.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: sizes.filter { it.width >= 1280 }.minByOrNull { Math.abs(it.width.toFloat() / it.height - 16f / 9f) }
             ?: sizes.maxByOrNull { it.width * it.height }
-            ?: Size(targetW, targetH)
+            ?: Size(1920, 1080)
     }
 
-    private fun createSession(preview: Surface, video: Surface?) {
-        val device = cameraDevice ?: return
+    private fun createSession(dev: CameraDevice, preview: Surface, video: Surface?) {
         val reader = imageReader ?: return
 
-        // PRIMERO: intentar con 3 surfaces (preview + encoder + imageReader)
-        // Si falla, usar solo 2 (preview + imageReader)
-        val surfacesWith3 = mutableListOf(preview, reader.surface)
-        if (video != null) surfacesWith3.add(video)
+        // Intentar con 3 surfaces. Si falla, usar 2.
+        val all = mutableListOf(preview, reader.surface)
+        if (video != null) all.add(video)
 
         try {
-            device.createCaptureSession(surfacesWith3, object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
+            dev.createCaptureSession(all, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
                     encoderConnected = video != null
-                    Log.i(TAG, "✅ Sesión configurada (${surfacesWith3.size} surfaces, encoder=$encoderConnected)")
-                    startPreview(session, preview, video)
-                }
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.w(TAG, "⚠️ Sesión con ${surfacesWith3.size} surfaces falló, intentando con 2...")
-                    encoderConnected = false
-                    // Fallback: solo preview + imageReader
-                    createFallbackSession(preview)
-                }
-            }, backgroundHandler)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creando sesión", e)
-            createFallbackSession(preview)
-        }
-    }
-
-    private fun createFallbackSession(preview: Surface) {
-        val device = cameraDevice ?: return
-        val reader = imageReader ?: return
-        try {
-            device.createCaptureSession(listOf(preview, reader.surface), object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
-                    encoderConnected = false
-                    Log.i(TAG, "✅ Sesión fallback (2 surfaces) OK")
-                    startPreview(session, preview, null)
+                    captureSession = s
+                    Log.i(TAG, "✅ Session OK: ${all.size} surfaces, encoder=$encoderConnected")
+                    startPreview(s, dev, preview, video)
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) {
-                    Log.e(TAG, "❌ Sesión fallback TAMBIÉN falló")
+                    Log.w(TAG, "⚠️ ${all.size} surfaces falló")
+                    if (video != null) {
+                        // Fallback: solo 2 surfaces
+                        encoderConnected = false
+                        dev.createCaptureSession(listOf(preview, reader.surface), object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s2: CameraCaptureSession) {
+                                captureSession = s2
+                                Log.i(TAG, "✅ Fallback 2 surfaces OK")
+                                startPreview(s2, dev, preview, null)
+                            }
+                            override fun onConfigureFailed(s2: CameraCaptureSession) {
+                                Log.e(TAG, "❌ Fallback también falló")
+                            }
+                        }, bgHandler)
+                    }
                 }
-            }, backgroundHandler)
+            }, bgHandler)
         } catch (e: Exception) {
-            Log.e(TAG, "Error en sesión fallback", e)
+            Log.e(TAG, "createSession error", e)
         }
     }
 
-    private fun startPreview(session: CameraCaptureSession, preview: Surface, video: Surface?) {
-        val device = cameraDevice ?: return
-        previewRequestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+    private fun startPreview(session: CameraCaptureSession, dev: CameraDevice, preview: Surface, video: Surface?) {
+        previewBuilder = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(preview)
             if (video != null && encoderConnected) addTarget(video)
             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         }
         try {
-            session.setRepeatingRequest(previewRequestBuilder!!.build(), null, backgroundHandler)
-            Log.i(TAG, "✅ Preview iniciado")
+            session.setRepeatingRequest(previewBuilder!!.build(), null, bgHandler)
         } catch (e: Exception) {
-            Log.e(TAG, "Error en preview", e)
+            Log.e(TAG, "Preview error", e)
         }
     }
 
-    fun setZoom(zoomLevel: Float) {
-        val builder = previewRequestBuilder ?: return
-        val session = captureSession ?: return
-        val sensor = sensorArraySize ?: return
-        val z = zoomLevel.coerceIn(1.0f, maxZoom)
-        val cw = sensor.width() / z; val ch = sensor.height() / z
-        builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(
-            ((sensor.width() - cw) / 2).toInt(), ((sensor.height() - ch) / 2).toInt(),
-            ((sensor.width() + cw) / 2).toInt(), ((sensor.height() + ch) / 2).toInt()
+    fun setZoom(level: Float) {
+        val b = previewBuilder ?: return; val s = captureSession ?: return; val r = sensorRect ?: return
+        val z = level.coerceIn(1f, maxZoom)
+        val cw = r.width() / z; val ch = r.height() / z
+        b.set(CaptureRequest.SCALER_CROP_REGION, Rect(
+            ((r.width() - cw) / 2).toInt(), ((r.height() - ch) / 2).toInt(),
+            ((r.width() + cw) / 2).toInt(), ((r.height() + ch) / 2).toInt()
         ))
-        try { session.setRepeatingRequest(builder.build(), null, backgroundHandler) } catch (_: Exception) {}
+        try { s.setRepeatingRequest(b.build(), null, bgHandler) } catch (_: Exception) {}
     }
 
     fun setFlash(mode: Int) {
-        val b = previewRequestBuilder ?: return; val s = captureSession ?: return
+        val b = previewBuilder ?: return; val s = captureSession ?: return
         when (mode) {
             0 -> { b.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF); b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON) }
             1 -> b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH)
             2 -> b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
         }
-        try { s.setRepeatingRequest(b.build(), null, backgroundHandler) } catch (_: Exception) {}
+        try { s.setRepeatingRequest(b.build(), null, bgHandler) } catch (_: Exception) {}
     }
 
-    fun setHdr(enabled: Boolean) {
-        val b = previewRequestBuilder ?: return; val s = captureSession ?: return
-        if (enabled) { b.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR); b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE) }
-        else { b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO) }
-        try { s.setRepeatingRequest(b.build(), null, backgroundHandler) } catch (_: Exception) {}
+    fun setHdr(on: Boolean) {
+        val b = previewBuilder ?: return; val s = captureSession ?: return
+        if (on) { b.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR); b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE) }
+        else b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        try { s.setRepeatingRequest(b.build(), null, bgHandler) } catch (_: Exception) {}
     }
 
-    fun focusAt(x: Float, y: Float, viewW: Int, viewH: Int) {
-        val b = previewRequestBuilder ?: return; val s = captureSession ?: return; val sensor = sensorArraySize ?: return
-        val fx = (x / viewW * sensor.width()).toInt(); val fy = (y / viewH * sensor.height()).toInt()
-        val half = sensor.width() / 10
-        val rect = Rect((fx-half).coerceAtLeast(0), (fy-half).coerceAtLeast(0), (fx+half).coerceAtMost(sensor.width()), (fy+half).coerceAtMost(sensor.height()))
+    fun focusAt(x: Float, y: Float, vw: Int, vh: Int) {
+        val b = previewBuilder ?: return; val s = captureSession ?: return; val r = sensorRect ?: return
+        val fx = (x / vw * r.width()).toInt(); val fy = (y / vh * r.height()).toInt()
+        val h = r.width() / 10
+        val rect = Rect((fx-h).coerceAtLeast(0), (fy-h).coerceAtLeast(0), (fx+h).coerceAtMost(r.width()), (fy+h).coerceAtMost(r.height()))
         b.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)))
         b.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)))
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-        try { s.setRepeatingRequest(b.build(), null, backgroundHandler) } catch (_: Exception) {}
+        try { s.setRepeatingRequest(b.build(), null, bgHandler) } catch (_: Exception) {}
     }
 
-    fun takePicture() {
-        val device = cameraDevice ?: run { Log.e(TAG, "❌ takePicture: device null"); return }
-        val session = captureSession ?: run { Log.e(TAG, "❌ takePicture: session null"); return }
-        val reader = imageReader ?: run { Log.e(TAG, "❌ takePicture: reader null"); return }
-        if (isCapturing) { Log.w(TAG, "⚠️ Ya capturando"); return }
+    /**
+     * Calcula la orientación JPEG correcta.
+     * - Trasera: sensorOrientation (usualmente 90°)
+     * - Frontal: Espejado para que no salga invertida
+     */
+    private fun getJpegOrientation(deviceRotation: Int): Int {
+        val camId = currentCameraId ?: return 90
+        val sensorOri = cameraManager.getCameraCharacteristics(camId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
+        return if (isFrontCamera) {
+            // Frontal: compensar orientación del sensor + rotación del dispositivo
+            (sensorOri + deviceRotation) % 360
+        } else {
+            // Trasera: compensar orientación del sensor + rotación del dispositivo
+            (sensorOri - deviceRotation + 360) % 360
+        }
+    }
+
+    fun takePicture(deviceRotation: Int = 0) {
+        val dev = cameraDevice ?: run { Log.e(TAG, "No device"); return }
+        val ses = captureSession ?: run { Log.e(TAG, "No session"); return }
+        val rdr = imageReader ?: run { Log.e(TAG, "No reader"); return }
+        if (isCapturing) { Log.w(TAG, "Busy"); return }
         isCapturing = true
-        Log.i(TAG, "📸 Capturando foto...")
+        Log.i(TAG, "📸 Taking picture... front=$isFrontCamera")
 
         try {
-            val camId = currentCameraId ?: return
-            val sensorOri = cameraManager.getCameraCharacteristics(camId)
-                .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-            val jpegOri = if (isFrontCamera) (360 - sensorOri) % 360 else sensorOri
-
-            val captureReq = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
+            val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(rdr.surface)
                 set(CaptureRequest.JPEG_QUALITY, 98.toByte())
-                set(CaptureRequest.JPEG_ORIENTATION, jpegOri)
+                set(CaptureRequest.JPEG_ORIENTATION, getJpegOrientation(deviceRotation))
                 set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
-                previewRequestBuilder?.build()?.get(CaptureRequest.SCALER_CROP_REGION)?.let {
+                // Copiar zoom del preview
+                previewBuilder?.build()?.get(CaptureRequest.SCALER_CROP_REGION)?.let {
                     set(CaptureRequest.SCALER_CROP_REGION, it)
                 }
             }.build()
 
-            session.capture(captureReq, object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
-                    Log.i(TAG, "✅ onCaptureCompleted")
+            ses.capture(req, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                    Log.i(TAG, "✅ Capture completed")
                 }
                 override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
-                    Log.e(TAG, "❌ onCaptureFailed: ${f.reason}")
+                    Log.e(TAG, "❌ Capture failed: ${f.reason}")
                     isCapturing = false
                 }
-            }, backgroundHandler)
+            }, bgHandler)
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Exception en capture", e)
+            Log.e(TAG, "Capture exception", e)
             isCapturing = false
         }
     }
@@ -284,7 +258,8 @@ class LuminaCameraManager(private val context: Context) {
         try { captureSession?.close() } catch (_: Exception) {}
         try { cameraDevice?.close() } catch (_: Exception) {}
         try { imageReader?.close() } catch (_: Exception) {}
-        try { backgroundThread?.quitSafely() } catch (_: Exception) {}
-        captureSession = null; cameraDevice = null; imageReader = null; isCapturing = false; encoderConnected = false
+        try { bgThread?.quitSafely() } catch (_: Exception) {}
+        captureSession = null; cameraDevice = null; imageReader = null
+        isCapturing = false; encoderConnected = false
     }
 }
