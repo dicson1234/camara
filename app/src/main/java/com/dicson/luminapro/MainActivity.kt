@@ -306,8 +306,13 @@ class MainActivity : AppCompatActivity() {
     // === CAPTURA ===
 
     private fun takeLivePhoto() {
+        Log.i(TAG, "takeLivePhoto: live=$livePhotoEnabled, encoderReady=${videoEncoder.isReady()}, encoderConnected=${luminaCamera.encoderConnected}")
+
         luminaCamera.onPhotoCaptured = { jpegBytes ->
-            if (livePhotoEnabled && videoEncoder.isReady()) {
+            Log.i(TAG, "📸 Foto recibida: ${jpegBytes.size} bytes")
+            val canLive = livePhotoEnabled && luminaCamera.encoderConnected && videoEncoder.isReady()
+
+            if (canLive) {
                 runOnUiThread { showLiveRecordingAnimation() }
                 val tmpFile = File(cacheDir, "tmp_live.mp4")
                 videoEncoder.extractLivePhotoVideo(tmpFile, 1500L) { mp4Bytes ->
@@ -315,23 +320,26 @@ class MainActivity : AppCompatActivity() {
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
                             if (mp4Bytes != null && mp4Bytes.isNotEmpty()) {
+                                Log.i(TAG, "🎬 Video capturado: ${mp4Bytes.size} bytes")
                                 val liveBytes = LivePhotoBuilder.buildMotionPhotoBytes(jpegBytes, mp4Bytes)
-                                val filename = "LuminaMP_${System.currentTimeMillis()}.jpg"
-                                saveToGallery(liveBytes, filename)
+                                saveToGallery(liveBytes, "LuminaMP_${System.currentTimeMillis()}.jpg")
                                 showToast("¡Live Photo guardada! ✨")
                             } else {
+                                Log.w(TAG, "Video vacío, guardando solo foto")
                                 saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                                 showToast("Foto guardada ✨")
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "Error Live Photo", e)
+                            Log.e(TAG, "Error empaquetando Live Photo", e)
                             saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
-                            showToast("Foto guardada (sin movimiento)")
+                            showToast("Foto guardada")
                         }
                     }
                 }
             } else {
+                // Guardar foto normal directamente
                 CoroutineScope(Dispatchers.IO).launch {
+                    Log.i(TAG, "💾 Guardando foto estática...")
                     saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
                     showToast("Foto guardada ✨")
                 }
@@ -341,26 +349,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveToGallery(imageBytes: ByteArray, filename: String) {
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
-            if (Build.VERSION.SDK_INT >= 29) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LuminaPro")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+        Log.i(TAG, "💾 saveToGallery: $filename (${imageBytes.size} bytes)")
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
+                put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis())
+                if (Build.VERSION.SDK_INT >= 29) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LuminaPro")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
             }
-        }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-        uri?.let {
-            contentResolver.openOutputStream(it)?.use { os ->
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri == null) {
+                Log.e(TAG, "❌ MediaStore insert retornó null - ¿permisos?")
+                return
+            }
+            contentResolver.openOutputStream(uri)?.use { os ->
                 os.write(imageBytes)
                 os.flush()
+            } ?: run {
+                Log.e(TAG, "❌ openOutputStream retornó null para $uri")
+                return
             }
             if (Build.VERSION.SDK_INT >= 29) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                contentResolver.update(it, values, null, null)
+                val update = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                contentResolver.update(uri, update, null, null)
             }
+            Log.i(TAG, "✅ Guardada en galería: $uri")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error guardando en galería", e)
         }
     }
 
