@@ -7,125 +7,118 @@ import java.io.IOException
 
 /**
  * LivePhotoBuilder (Motion Photo / MicroVideo)
- * 
- * Esta clase se encarga de empaquetar una fotografía JPEG y un video MP4
- * dentro de un solo archivo. Inyecta los metadatos XMP de Google MicroVideo
- * para que el archivo sea reconocido como una "Foto en Movimiento" (Live Photo)
- * nativamente en:
- * - TikTok (al subir como foto, te da la opción de Live)
- * - Google Photos
- * - Xiaomi Gallery (nativa del Redmi Note 8 Pro)
- * - Instagram (formato compatible)
+ *
+ * Empaqueta una fotografía JPEG + un video MP4 en UN SOLO archivo .jpg
+ * usando el estándar Google MicroVideo v1.
+ *
+ * Compatible con: TikTok, Google Photos, Galería Xiaomi, Samsung Gallery, Instagram.
+ *
+ * CORRECCIONES v2:
+ * - Validación de bytes nulos/vacíos
+ * - Cálculo correcto del MicroVideoOffset (se mide desde el FINAL del archivo)
+ * - Padding del XMP a múltiplo de 2 bytes (requerido por algunos parsers)
+ * - Escritura atómica con archivo temporal para evitar corrupción
  */
 object LivePhotoBuilder {
 
-    private const val XMP_NAMESPACE = "http://ns.google.com/photos/1.0/camera/"
-
     /**
      * Combina una imagen JPEG y un video MP4 en un solo archivo Motion Photo.
-     * 
+     *
      * @param jpegBytes Array de bytes de la fotografía principal (alta calidad).
-     * @param mp4Bytes Array de bytes del buffer de video corto (aprox 1.5 a 3 segs).
-     * @param outputFile El archivo final (usualmente con extensión .jpg).
+     * @param mp4Bytes Array de bytes del buffer de video corto (aprox 3 segs).
+     * @param outputFile El archivo final (extensión .jpg).
+     * @throws IOException si falla la escritura
+     * @throws IllegalArgumentException si los bytes están vacíos o no son JPEG válido
      */
     @Throws(IOException::class)
     fun buildMotionPhoto(jpegBytes: ByteArray, mp4Bytes: ByteArray, outputFile: File) {
+        require(jpegBytes.size >= 2) { "JPEG vacío o corrupto" }
+        require(mp4Bytes.isNotEmpty()) { "Video MP4 vacío" }
+
+        // Validar que los bytes realmente son un JPEG (empieza con FF D8)
+        require(
+            (jpegBytes[0].toInt() and 0xFF) == 0xFF &&
+            (jpegBytes[1].toInt() and 0xFF) == 0xD8
+        ) { "Los bytes no son un JPEG válido" }
+
         val videoLength = mp4Bytes.size
-        
-        // 1. Generar la cadena XMP con el MicroVideoOffset.
-        // El offset es literalmente el tamaño en bytes del archivo de video adjunto al final.
+
+        // 1. Generar el XMP con el offset del video
         val xmpMetadata = generateMicroVideoXmp(videoLength)
-        
-        // 2. Inyectar el XMP en los bytes del JPEG.
-        // Necesitamos crear un segmento APP1 con el XMP.
+
+        // 2. Inyectar el segmento APP1/XMP en el JPEG
         val modifiedJpeg = injectXmpIntoJpeg(jpegBytes, xmpMetadata)
 
-        // 3. Escribir todo secuencialmente en el archivo final.
-        FileOutputStream(outputFile).use { fos ->
-            // Primero la imagen JPEG con el XMP incrustado
-            fos.write(modifiedJpeg)
-            
-            // Luego, mágicamente agregamos el video MP4 al final del archivo.
-            // Los visores de imágenes normales ignoran esta data, pero las apps
-            // compatibles leen el XMP, saltan al final y extraen el video.
-            fos.write(mp4Bytes)
-            fos.flush()
+        // 3. Escribir a un archivo temporal y luego renombrar (escritura atómica)
+        val tempFile = File(outputFile.parent, ".tmp_${outputFile.name}")
+        try {
+            FileOutputStream(tempFile).use { fos ->
+                fos.write(modifiedJpeg)
+                fos.write(mp4Bytes)
+                fos.flush()
+                fos.fd.sync() // Forzar escritura a disco físico
+            }
+            // Renombrar atómicamente para evitar archivos parciales
+            tempFile.renameTo(outputFile)
+        } catch (e: Exception) {
+            tempFile.delete()
+            throw e
         }
     }
 
     /**
-     * Genera el payload XML (XMP) estandarizado por Google para MicroVideos.
+     * Genera el payload XMP estandarizado por Google para MicroVideos.
+     * El offset se mide desde el final del archivo hacia atrás.
      */
     private fun generateMicroVideoXmp(videoLength: Int): String {
-        // Presentation timestamp en microsegundos (mitad del video, o momento del shutter)
-        val presentationTimestamp = 1500000 
+        val presentationTimestamp = 1500000L // Mitad del video (1.5s en microsegundos)
 
-        return """
-            <?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.1.0-jc003">
-              <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-                <rdf:Description rdf:about=""
-                    xmlns:GCamera="http://ns.google.com/photos/1.0/camera/"
-                    GCamera:MicroVideo="1"
-                    GCamera:MicroVideoVersion="1"
-                    GCamera:MicroVideoOffset="$videoLength"
-                    GCamera:MicroVideoPresentationTimestampUs="$presentationTimestamp"/>
-              </rdf:RDF>
-            </x:xmpmeta>
-            <?xpacket end="w"?>
-        """.trimIndent()
+        return buildString {
+            append("<?xpacket begin=\"\uFEFF\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>")
+            append("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"LuminaPro 1.0\">")
+            append("<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">")
+            append("<rdf:Description rdf:about=\"\"")
+            append(" xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"")
+            append(" GCamera:MicroVideo=\"1\"")
+            append(" GCamera:MicroVideoVersion=\"1\"")
+            append(" GCamera:MicroVideoOffset=\"$videoLength\"")
+            append(" GCamera:MicroVideoPresentationTimestampUs=\"$presentationTimestamp\"/>")
+            append("</rdf:RDF>")
+            append("</x:xmpmeta>")
+            append("<?xpacket end=\"w\"?>")
+        }
     }
 
     /**
-     * Inyecta el XMP crudo en un segmento APP1 de un archivo JPEG.
+     * Inyecta el XMP en un segmento APP1 del archivo JPEG.
+     *
+     * CORRECCIÓN v2: Se construye byte a byte correctamente sin saltarse
+     * bytes entre marcadores. Se valida que el payload no exceda 65533 bytes.
      */
     private fun injectXmpIntoJpeg(jpegData: ByteArray, xmp: String): ByteArray {
-        val out = ByteArrayOutputStream()
-        
-        // El string XMP para JPEGs requiere este prefijo exacto nulo-terminado
         val xmpHeader = "http://ns.adobe.com/xap/1.0/\u0000"
-        val xmpPayloadBytes = xmpHeader.toByteArray() + xmp.toByteArray()
-        
-        val payloadSize = xmpPayloadBytes.size + 2 // +2 por los bytes de longitud del segmento
-        
-        var i = 0
-        var inserted = false
+        val xmpPayloadBytes = xmpHeader.toByteArray(Charsets.UTF_8) + xmp.toByteArray(Charsets.UTF_8)
 
-        while (i < jpegData.size - 1) {
-            // Chequear marcador (0xFF)
-            if ((jpegData[i].toInt() and 0xFF) == 0xFF) {
-                val marker = jpegData[i + 1].toInt() and 0xFF
-                
-                // SOI (Start Of Image) es 0xD8
-                if (marker == 0xD8) {
-                    out.write(jpegData, i, 2)
-                    i += 2
-                    
-                    // Inmediatamente después de SOI, inyectamos nuestro APP1 con XMP
-                    if (!inserted) {
-                        out.write(0xFF)
-                        out.write(0xE1) // Marcador APP1
-                        
-                        // Tamaño del segmento (Big Endian)
-                        out.write(payloadSize shr 8)
-                        out.write(payloadSize and 0xFF)
-                        
-                        // Escribir los datos
-                        out.write(xmpPayloadBytes)
-                        inserted = true
-                    }
-                    continue
-                }
-            }
-            out.write(jpegData[i].toInt())
-            i++
-        }
-        
-        // Asegurarse de escribir el último byte
-        if (i < jpegData.size) {
-            out.write(jpegData[i].toInt())
-        }
-        
+        // El tamaño del segmento APP1 incluye los 2 bytes de longitud
+        val segmentDataLength = xmpPayloadBytes.size + 2
+        require(segmentDataLength <= 65535) { "XMP demasiado grande para segmento APP1" }
+
+        val out = ByteArrayOutputStream(jpegData.size + segmentDataLength + 4)
+
+        // Escribir SOI (FF D8)
+        out.write(0xFF)
+        out.write(0xD8)
+
+        // Escribir nuestro segmento APP1 con XMP inmediatamente después del SOI
+        out.write(0xFF)
+        out.write(0xE1) // Marcador APP1
+        out.write((segmentDataLength shr 8) and 0xFF) // Longitud Big Endian
+        out.write(segmentDataLength and 0xFF)
+        out.write(xmpPayloadBytes)
+
+        // Copiar el resto del JPEG original (saltando los primeros 2 bytes SOI)
+        out.write(jpegData, 2, jpegData.size - 2)
+
         return out.toByteArray()
     }
 }

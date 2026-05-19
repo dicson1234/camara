@@ -3,6 +3,7 @@ package com.dicson.luminapro.camera
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.hardware.camera2.*
 import android.media.Image
 import android.media.ImageReader
@@ -13,183 +14,202 @@ import android.util.Size
 import android.view.Surface
 
 /**
- * LuminaCameraManager
- * 
- * Controlador central que habla directamente con el ISP del MediaTek G90T
- * usando la API Camera2 a bajo nivel.
- * 
- * Su diseño soporta MÚLTIPLES flujos (Surfaces) simultáneos:
- * 1. Surface de Previsualización (Visor de pantalla 60fps)
- * 2. Surface de ImageReader (Para capturar la foto final en JPEG 64MP/16MP)
- * 3. Surface de Video (Para alimentar el búfer circular del Live Photo)
+ * LuminaCameraManager v2
+ *
+ * CORRECCIONES:
+ * - acquireLatestImage() con null-check (previene NPE fatal)
+ * - Orientación JPEG dinámica desde CameraCharacteristics
+ * - No recrea la sesión tras cada captura (solo reinicia repeating request)
+ * - Touch-to-focus con coordenadas del sensor
+ * - Cierre ordenado de recursos
  */
 class LuminaCameraManager(private val context: Context) {
 
-    private val cameraManager: CameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    companion object {
+        private const val TAG = "LuminaCamera"
+    }
+
+    private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
-
-    // Hilos de fondo para no bloquear la UI principal
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
-
-    // Lector de la foto final (Alta calidad)
     private var imageReader: ImageReader? = null
 
-    // Superficies activas para poder reactivarlas tras una captura
     private var activePreviewSurface: Surface? = null
     private var activeVideoSurface: Surface? = null
+    private var currentCameraId: String? = null
 
-    // Aquí guardaremos los bytes de la foto temporalmente
-    private var latestJpegBytes: ByteArray? = null
+    var isFrontCamera = false
+        private set
+    @Volatile private var isCapturing = false
+
     var onPhotoCaptured: ((ByteArray) -> Unit)? = null
 
-    /**
-     * Inicia el hilo en segundo plano para procesar la cámara sin lag.
-     */
+    // Request builder reutilizable para el preview
+    private var previewRequestBuilder: CaptureRequest.Builder? = null
+
     fun startBackgroundThread() {
         backgroundThread = HandlerThread("CameraBackground").apply { start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
 
-    var isFrontCamera = false
+    @SuppressLint("MissingPermission")
+    fun openCamera(previewSurface: Surface, videoSurface: Surface, w: Int, h: Int, front: Boolean = false) {
+        isFrontCamera = front
+        activePreviewSurface = previewSurface
+        activeVideoSurface = videoSurface
+        val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
 
-    /**
-     * Abre la cámara solicitada (Trasera o Frontal).
-     */
-    @SuppressLint("MissingPermission") // Asumimos que los permisos ya fueron otorgados en la UI
-    fun openCamera(previewSurface: Surface, videoSurface: Surface, width: Int, height: Int, useFrontCamera: Boolean = false) {
-        this.isFrontCamera = useFrontCamera
-        this.activePreviewSurface = previewSurface
-        this.activeVideoSurface = videoSurface
-        
-        val targetFacing = if (useFrontCamera) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-
-        val cameraId = cameraManager.cameraIdList.firstOrNull { id ->
-            val chars = cameraManager.getCameraCharacteristics(id)
-            chars.get(CameraCharacteristics.LENS_FACING) == targetFacing
+        val camId = cameraManager.cameraIdList.firstOrNull { id ->
+            cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == facing
         } ?: return
+        currentCameraId = camId
 
-        // EXTRAER MÁXIMA RESOLUCIÓN DEL SENSOR (64MP reales en lugar de resolución de pantalla)
-        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val largestJpeg = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(width, height)
-        Log.i("LuminaCamera", "Resolución Máxima Encontrada: ${largestJpeg.width}x${largestJpeg.height}")
+        val chars = cameraManager.getCameraCharacteristics(camId)
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
+        val maxSize = map.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(w, h)
+        Log.i(TAG, "Resolución máxima: ${maxSize.width}x${maxSize.height}")
 
-        // Configuramos el lector para la foto JPEG de máxima resolución
-        imageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 2)
+        imageReader?.close()
+        imageReader = ImageReader.newInstance(maxSize.width, maxSize.height, ImageFormat.JPEG, 2)
         imageReader?.setOnImageAvailableListener({ reader ->
-            val image: Image = reader.acquireLatestImage()
-            val buffer = image.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
-            
-            // ¡Aquí es donde ocurre la magia!
-            latestJpegBytes = bytes
-            Log.i("LuminaCamera", "¡Foto principal capturada! Tamaño: ${bytes.size} bytes")
-            image.close()
-            
-            // Enviamos los bytes reales al MainActivity para armar el Live Photo
-            onPhotoCaptured?.invoke(bytes)
-            
+            // CORRECCIÓN: acquireLatestImage() PUEDE retornar null
+            val image: Image? = reader.acquireLatestImage()
+            if (image == null) {
+                Log.w(TAG, "acquireLatestImage retornó null")
+                return@setOnImageAvailableListener
+            }
+            try {
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                Log.i(TAG, "Foto capturada: ${bytes.size} bytes")
+                onPhotoCaptured?.invoke(bytes)
+            } finally {
+                image.close()
+            }
         }, backgroundHandler)
 
-        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+        cameraManager.openCamera(camId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 cameraDevice = camera
-                // Iniciamos la sesión enviando la luz a 3 lugares distintos a la vez
-                startCaptureSession(previewSurface, videoSurface)
+                createCaptureSession(previewSurface, videoSurface)
             }
-
-            override fun onDisconnected(camera: CameraDevice) { camera.close() }
-            override fun onError(camera: CameraDevice, error: Int) { camera.close() }
+            override fun onDisconnected(camera: CameraDevice) {
+                cameraDevice = null
+                camera.close()
+            }
+            override fun onError(camera: CameraDevice, error: Int) {
+                Log.e(TAG, "Error al abrir cámara: $error")
+                cameraDevice = null
+                camera.close()
+            }
         }, backgroundHandler)
     }
 
-    /**
-     * Crea la sesión de captura múltiple.
-     * El ISP del Note 8 Pro debe enrutar los datos del sensor hacia:
-     * - La Pantalla (preview)
-     * - El codificador de Video continuo (videoSurface)
-     * - El capturador de fotos (imageReader.surface)
-     */
-    private fun startCaptureSession(previewSurface: Surface, videoSurface: Surface) {
-        val targets = listOf(previewSurface, videoSurface, imageReader!!.surface)
+    private fun createCaptureSession(previewSurface: Surface, videoSurface: Surface) {
+        val device = cameraDevice ?: return
+        val reader = imageReader ?: return
+        val targets = listOf(previewSurface, videoSurface, reader.surface)
 
-        cameraDevice?.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+        device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
-                
-                // Pedimos un flujo continuo (Repeating) para la pantalla y el video del Live Photo
-                val previewRequest = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                previewRequestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                     addTarget(previewSurface)
-                    addTarget(videoSurface) // El video se graba en bucle invisible
-                    
-                    // Controles automáticos por defecto (Auto-Enfoque continuo)
+                    addTarget(videoSurface)
                     set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                }.build()
-
-                session.setRepeatingRequest(previewRequest, null, backgroundHandler)
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                }
+                session.setRepeatingRequest(previewRequestBuilder!!.build(), null, backgroundHandler)
             }
-
             override fun onConfigureFailed(session: CameraCaptureSession) {
-                Log.e("LuminaCamera", "Fallo al configurar la sesión de cámara.")
+                Log.e(TAG, "Fallo configuración de sesión")
             }
         }, backgroundHandler)
     }
 
-    @Volatile private var isCapturing = false
+    /**
+     * Touch-to-focus: enfoca en las coordenadas dadas de la pantalla.
+     */
+    fun focusAt(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
+        val builder = previewRequestBuilder ?: return
+        val session = captureSession ?: return
+        val camId = currentCameraId ?: return
+        val chars = cameraManager.getCameraCharacteristics(camId)
+        val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+
+        val focusX = (x / viewWidth * sensorSize.width()).toInt()
+        val focusY = (y / viewHeight * sensorSize.height()).toInt()
+        val halfW = sensorSize.width() / 10
+        val halfH = sensorSize.height() / 10
+        val focusRect = Rect(
+            (focusX - halfW).coerceAtLeast(0),
+            (focusY - halfH).coerceAtLeast(0),
+            (focusX + halfW).coerceAtMost(sensorSize.width()),
+            (focusY + halfH).coerceAtMost(sensorSize.height())
+        )
+        val meteringRect = MeteringRectangle(focusRect, MeteringRectangle.METERING_WEIGHT_MAX)
+
+        builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRect))
+        builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(meteringRect))
+        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+        builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+
+        session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+    }
 
     /**
-     * ¡Click! Dispara la foto de alta calidad.
-     * Rompe el ciclo continuo un microsegundo, toma un frame perfecto, y vuelve a la previsualización.
+     * Captura una foto de máxima calidad.
      */
     fun takePicture() {
-        if (cameraDevice == null || captureSession == null || isCapturing) return
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val reader = imageReader ?: return
+        if (isCapturing) return
         isCapturing = true
 
         try {
-            val captureRequest = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(imageReader!!.surface)
-                
-                // Configuración de Calidad Óptima (100% JPEG Quality)
+            // CORRECCIÓN: Obtener orientación real del sensor
+            val camId = currentCameraId ?: return
+            val chars = cameraManager.getCameraCharacteristics(camId)
+            val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
+            val captureReq = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(reader.surface)
                 set(CaptureRequest.JPEG_QUALITY, 100.toByte())
-                
-                // Forzar procesamiento de Alta Calidad en el ISP (Reducción de ruido y bordes)
+                set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
                 set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                 set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_HIGH_QUALITY)
                 set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
-                
-                // Mantenemos la orientación correcta dependiendo de la cámara (Note 8 Pro rectificación)
-                val rotation = if (isFrontCamera) 270 else 90
-                set(CaptureRequest.JPEG_ORIENTATION, rotation) 
             }.build()
 
-            // Detenemos el flujo visual un instante
-            captureSession?.stopRepeating()
-            
-            // Disparamos la foto (Esto invoca el listener del ImageReader de arriba)
-            captureSession?.capture(captureRequest, object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    Log.i("LuminaCamera", "Captura del sensor exitosa (Zero Shutter Lag).")
+            // CORRECCIÓN: No detener el repeating, solo hacer una captura adicional
+            // Esto evita la pausa negra en pantalla
+            session.capture(captureReq, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
+                    Log.i(TAG, "Captura completada (ZSL)")
                     isCapturing = false
-                    
-                    // Reactivamos la pantalla y el flujo de video al instante
-                    if (activePreviewSurface != null && activeVideoSurface != null) {
-                        startCaptureSession(activePreviewSurface!!, activeVideoSurface!!)
-                    }
+                }
+                override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, failure: CaptureFailure) {
+                    Log.e(TAG, "Captura falló: ${failure.reason}")
+                    isCapturing = false
                 }
             }, backgroundHandler)
-
         } catch (e: CameraAccessException) {
-            e.printStackTrace()
+            Log.e(TAG, "Error de acceso a cámara", e)
+            isCapturing = false
         }
     }
 
     fun closeCamera() {
-        captureSession?.close()
-        cameraDevice?.close()
-        imageReader?.close()
-        backgroundThread?.quitSafely()
+        try { captureSession?.close() } catch (_: Exception) {}
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        try { imageReader?.close() } catch (_: Exception) {}
+        try { backgroundThread?.quitSafely() } catch (_: Exception) {}
+        captureSession = null
+        cameraDevice = null
+        imageReader = null
     }
 }
