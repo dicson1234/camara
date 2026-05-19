@@ -3,7 +3,9 @@ package com.dicson.luminapro
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
 import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -11,10 +13,9 @@ import android.provider.MediaStore
 import android.util.Log
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -30,12 +31,12 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "LuminaPro"
-        private const val REQ_PERMISSIONS = 10
+        private const val REQ_PERMS = 10
     }
 
     private lateinit var luminaCamera: LuminaCameraManager
     private lateinit var videoEncoder: CircularVideoEncoder
-    private lateinit var viewFinder: SurfaceView
+    private lateinit var viewFinder: TextureView
     private lateinit var captureButton: View
     private lateinit var switchCameraBtn: View
     private lateinit var liveIndicator: TextView
@@ -43,31 +44,21 @@ class MainActivity : AppCompatActivity() {
     private lateinit var zoomLabel: TextView
     private lateinit var timerLabel: TextView
     private lateinit var hdrBtn: TextView
-    private lateinit var gridOverlay: View
 
     private var isUsingFrontCamera = false
     private var livePhotoEnabled = true
-    private var isSurfaceReady = false
-    private var flashMode = 0 // 0=off, 1=on, 2=auto
-    private var showGrid = false
-    private var timerSeconds = 0 // 0, 3, 10
+    private var flashMode = 0
+    private var timerSeconds = 0
     private var hdrEnabled = false
-
-    // Pinch-to-zoom
-    private lateinit var scaleDetector: ScaleGestureDetector
     private var currentZoom = 1.0f
+    private var cameraInitialized = false
+
+    private lateinit var scaleDetector: ScaleGestureDetector
 
     private fun getRequiredPermissions(): Array<String> {
-        val perms = mutableListOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        )
-        if (Build.VERSION.SDK_INT <= 32) {
-            perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            perms.add("android.permission.READ_MEDIA_IMAGES")
-        }
+        val perms = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT <= 32) perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        if (Build.VERSION.SDK_INT >= 33) perms.add("android.permission.READ_MEDIA_IMAGES")
         return perms.toTypedArray()
     }
 
@@ -83,26 +74,24 @@ class MainActivity : AppCompatActivity() {
         zoomLabel = findViewById(R.id.zoomLabel)
         timerLabel = findViewById(R.id.timerLabel)
         hdrBtn = findViewById(R.id.hdrBtn)
-        gridOverlay = findViewById(R.id.gridOverlay)
 
-        setupZoomGesture()
+        setupZoom()
         setupButtons()
 
         if (allPermissionsGranted()) {
             initCamera()
         } else {
-            ActivityCompat.requestPermissions(this, getRequiredPermissions(), REQ_PERMISSIONS)
+            ActivityCompat.requestPermissions(this, getRequiredPermissions(), REQ_PERMS)
         }
     }
 
-    private fun setupZoomGesture() {
+    private fun setupZoom() {
         scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScale(detector: ScaleGestureDetector): Boolean {
-                currentZoom *= detector.scaleFactor
-                currentZoom = currentZoom.coerceIn(1.0f, 10.0f)
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                if (!cameraInitialized) return true
+                currentZoom = (currentZoom * d.scaleFactor).coerceIn(1.0f, 10.0f)
                 luminaCamera.setZoom(currentZoom)
                 zoomLabel.text = String.format("%.1fx", currentZoom)
-                zoomLabel.visibility = View.VISIBLE
                 return true
             }
         })
@@ -110,6 +99,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupButtons() {
         captureButton.setOnClickListener {
+            if (!cameraInitialized) return@setOnClickListener
             if (timerSeconds > 0) {
                 Toast.makeText(this, "Foto en ${timerSeconds}s...", Toast.LENGTH_SHORT).show()
                 captureButton.postDelayed({ takeLivePhoto() }, timerSeconds * 1000L)
@@ -119,14 +109,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         switchCameraBtn.setOnClickListener {
+            if (!cameraInitialized) return@setOnClickListener
             isUsingFrontCamera = !isUsingFrontCamera
             currentZoom = 1.0f
             zoomLabel.text = "1.0x"
-            luminaCamera.closeCamera()
-            luminaCamera.startBackgroundThread()
-            if (isSurfaceReady) {
-                luminaCamera.openCamera(viewFinder.holder.surface, videoEncoder.inputSurface, 1920, 1080, isUsingFrontCamera)
-            }
+            restartCamera()
         }
 
         liveIndicator.setOnClickListener {
@@ -136,9 +123,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         flashBtn.setOnClickListener {
+            if (!cameraInitialized) return@setOnClickListener
             flashMode = (flashMode + 1) % 3
-            val label = when (flashMode) { 0 -> "⚡OFF"; 1 -> "⚡ON"; else -> "⚡AUTO" }
-            flashBtn.text = label
+            flashBtn.text = when (flashMode) { 0 -> "⚡OFF"; 1 -> "⚡ON"; else -> "⚡AUTO" }
             luminaCamera.setFlash(flashMode)
         }
 
@@ -148,20 +135,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         hdrBtn.setOnClickListener {
+            if (!cameraInitialized) return@setOnClickListener
             hdrEnabled = !hdrEnabled
             hdrBtn.alpha = if (hdrEnabled) 1f else 0.4f
             luminaCamera.setHdr(hdrEnabled)
         }
 
-        gridOverlay.setOnClickListener {
-            showGrid = !showGrid
-            gridOverlay.visibility = if (showGrid) View.VISIBLE else View.GONE
-        }
-
-        // Touch-to-focus + zoom
         viewFinder.setOnTouchListener { v, event ->
             scaleDetector.onTouchEvent(event)
-            if (event.action == MotionEvent.ACTION_UP && event.pointerCount == 1) {
+            if (event.action == MotionEvent.ACTION_UP && !scaleDetector.isInProgress && cameraInitialized) {
                 luminaCamera.focusAt(event.x, event.y, v.width, v.height)
             }
             true
@@ -171,22 +153,41 @@ class MainActivity : AppCompatActivity() {
     private fun initCamera() {
         luminaCamera = LuminaCameraManager(this)
         luminaCamera.startBackgroundThread()
-        videoEncoder = CircularVideoEncoder(1920, 1080, 8_000_000, 30)
+        videoEncoder = CircularVideoEncoder(1280, 720, 4_000_000, 30)
         videoEncoder.startDraining()
+        cameraInitialized = true
 
-        viewFinder.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                isSurfaceReady = true
-                luminaCamera.openCamera(holder.surface, videoEncoder.inputSurface, 1920, 1080, isUsingFrontCamera)
+        if (viewFinder.isAvailable) {
+            openCameraWithTexture(viewFinder.surfaceTexture!!)
+        }
+
+        viewFinder.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                openCameraWithTexture(st)
             }
-            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) { isSurfaceReady = false }
-        })
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                luminaCamera.closeCamera()
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+    }
+
+    private fun openCameraWithTexture(st: SurfaceTexture) {
+        st.setDefaultBufferSize(1920, 1080)
+        val previewSurface = Surface(st)
+        luminaCamera.openCamera(previewSurface, videoEncoder.inputSurface, 1920, 1080, isUsingFrontCamera)
+    }
+
+    private fun restartCamera() {
+        luminaCamera.closeCamera()
+        luminaCamera.startBackgroundThread()
+        val st = viewFinder.surfaceTexture ?: return
+        openCameraWithTexture(st)
     }
 
     private fun takeLivePhoto() {
-        Toast.makeText(this, "📸 Capturando...", Toast.LENGTH_SHORT).show()
-
         luminaCamera.onPhotoCaptured = { jpegBytes ->
             if (livePhotoEnabled) {
                 val tmpFile = File(cacheDir, "tmp_live.mp4")
@@ -194,62 +195,70 @@ class MainActivity : AppCompatActivity() {
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
                             if (mp4Bytes != null && mp4Bytes.isNotEmpty()) {
-                                val out = createOutputFile("Lumina_Live")
-                                LivePhotoBuilder.buildMotionPhoto(jpegBytes, mp4Bytes, out)
-                                notifyGallery(out)
+                                val liveBytes = LivePhotoBuilder.buildMotionPhotoBytes(jpegBytes, mp4Bytes)
+                                saveToGallery(liveBytes, "Lumina_Live_${System.currentTimeMillis()}.jpg")
                                 showToast("¡Live Photo guardada! ✨")
                             } else {
-                                saveStaticJpeg(jpegBytes)
+                                saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                                showToast("Foto guardada ✨")
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "Error guardando", e)
+                            Log.e(TAG, "Error", e)
                             showToast("Error al guardar")
                         }
                     }
                 }
             } else {
-                CoroutineScope(Dispatchers.IO).launch { saveStaticJpeg(jpegBytes) }
+                CoroutineScope(Dispatchers.IO).launch {
+                    saveToGallery(jpegBytes, "Lumina_${System.currentTimeMillis()}.jpg")
+                    showToast("Foto guardada ✨")
+                }
             }
         }
         luminaCamera.takePicture()
     }
 
-    private fun createOutputFile(prefix: String): File {
-        val dcim = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "LuminaPro")
-        if (!dcim.exists()) dcim.mkdirs()
-        return File(dcim, "${prefix}_${System.currentTimeMillis()}.jpg")
-    }
+    /**
+     * Guarda los bytes directamente en la galería usando MediaStore.
+     * Funciona en Android 10+ (scoped storage) y versiones anteriores.
+     * Las fotos aparecen INSTANTÁNEAMENTE en Galería, Google Photos, TikTok, WhatsApp.
+     */
+    private fun saveToGallery(imageBytes: ByteArray, filename: String) {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis() / 1000)
+            if (Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/LuminaPro")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
 
-    private suspend fun saveStaticJpeg(bytes: ByteArray) {
-        val out = createOutputFile("Lumina")
-        out.writeBytes(bytes)
-        notifyGallery(out)
-        showToast("Foto guardada ✨")
-    }
-
-    private fun notifyGallery(file: File) {
-        MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
+        val uri: Uri? = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        uri?.let {
+            contentResolver.openOutputStream(it)?.use { os ->
+                os.write(imageBytes)
+                os.flush()
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                values.clear()
+                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                contentResolver.update(it, values, null, null)
+            }
+        }
     }
 
     private suspend fun showToast(msg: String) {
-        withContext(Dispatchers.Main) {
-            Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
-        }
+        withContext(Dispatchers.Main) { Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show() }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (code == REQ_PERMISSIONS) {
+        if (code == REQ_PERMS) {
             if (allPermissionsGranted()) {
                 initCamera()
             } else {
-                // Mostrar los permisos que faltan específicamente
-                val denied = getRequiredPermissions().filter {
-                    ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-                }
-                Toast.makeText(this, "Permisos necesarios: ${denied.size} pendientes", Toast.LENGTH_LONG).show()
-                // Reintentar
-                ActivityCompat.requestPermissions(this, denied.toTypedArray(), REQ_PERMISSIONS)
+                Toast.makeText(this, "Activa todos los permisos en Ajustes", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -260,7 +269,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (::luminaCamera.isInitialized) luminaCamera.closeCamera()
-        if (::videoEncoder.isInitialized) videoEncoder.stop()
+        if (cameraInitialized) { luminaCamera.closeCamera(); videoEncoder.stop() }
     }
 }

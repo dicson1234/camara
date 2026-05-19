@@ -5,8 +5,8 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Visor -->
-    <SurfaceView
+    <!-- Visor (TextureView funciona mejor que SurfaceView en chips MediaTek y Snapdragon) -->
+    <TextureView
         android:id="@+id/viewFinder"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
